@@ -1,0 +1,2 @@
+D:\workspace\windows\easyssh\bin\Release\net8.0\win-x64\publish\easyssh.pdb
+D:\workspace\windows\easyssh\bin\Release\net8.0\win-x64\publish\easyssh.exe

@@ -9,8 +9,9 @@ internal class InteractiveShell
     private ShellStream? _shell;
     private ConsoleInterop.ConsoleMode _originalInputMode;
     private ConsoleInterop.ConsoleMode _originalOutputMode;
-    private bool _isRunning;
+    private volatile bool _isRunning;
     private ConsoleInterop.ConsoleCtrlHandlerRoutine? _ctrlHandler;
+    private readonly ManualResetEventSlim _exitEvent = new(false);
 
     public InteractiveShell(SshClient client)
     {
@@ -94,49 +95,32 @@ internal class InteractiveShell
             new Dictionary<Renci.SshNet.Common.TerminalModes, uint>()
         );
 
+        // Use event-based reading - no polling, no timeout needed
+        _shell.DataReceived += OnDataReceived;
+        _shell.Closed += OnShellClosed;
+
         ConsoleInterop.EnableRawMode();
         _isRunning = true;
     }
 
-    private void RunShellLoop()
+    private void OnDataReceived(object? sender, Renci.SshNet.Common.ShellDataEventArgs e)
     {
-        var readThread = new Thread(ReadFromShell)
+        if (e.Data.Length > 0)
         {
-            IsBackground = true
-        };
-        readThread.Start();
-
-        WriteToShell();
-
-        _isRunning = false;
-        readThread.Join(1000);
+            var output = Encoding.UTF8.GetString(e.Data);
+            Console.Write(output);
+        }
     }
 
-    private void ReadFromShell()
+    private void OnShellClosed(object? sender, EventArgs e)
     {
-        try
-        {
-            var buffer = new byte[4096];
-            while (_isRunning && _shell != null)
-            {
-                if (_shell.DataAvailable)
-                {
-                    var bytesRead = _shell.Read(buffer, 0, buffer.Length);
-                    if (bytesRead > 0)
-                    {
-                        var output = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                        Console.Write(output);
-                    }
-                }
-                else
-                {
-                    Thread.Sleep(10);
-                }
-            }
-        }
-        catch
-        {
-        }
+        _isRunning = false;
+        _exitEvent.Set();
+    }
+
+    private void RunShellLoop()
+    {
+        WriteToShell();
     }
 
     private void WriteToShell()
@@ -145,35 +129,41 @@ internal class InteractiveShell
         {
             while (_isRunning && _shell != null)
             {
-                if (Console.KeyAvailable)
-                {
-                    var key = Console.ReadKey(true);
+                // Check if shell closed while waiting
+                if (_exitEvent.Wait(0))
+                    break;
 
-                    if (key.Key == ConsoleKey.C && key.Modifiers == ConsoleModifiers.Control)
-                    {
-                        _shell.Write(new byte[] { 0x03 }, 0, 1);
-                        _shell.Flush();
-                    }
-                    else if (key.Key == ConsoleKey.D && key.Modifiers == ConsoleModifiers.Control)
-                    {
-                        _shell.Write(new byte[] { 0x04 }, 0, 1);
-                        _shell.Flush();
-                        _isRunning = false;
-                        break;
-                    }
-                    else
-                    {
-                        var bytes = GetKeyBytes(key);
-                        if (bytes != null && bytes.Length > 0)
-                        {
-                            _shell.Write(bytes, 0, bytes.Length);
-                            _shell.Flush();
-                        }
-                    }
+                // Console.ReadKey blocks until input - CPU efficient
+                if (!Console.KeyAvailable)
+                {
+                    Thread.Sleep(10);
+                    continue;
+                }
+
+                var key = Console.ReadKey(true);
+
+                if (!_isRunning || _shell == null) break;
+
+                if (key.Key == ConsoleKey.C && key.Modifiers == ConsoleModifiers.Control)
+                {
+                    _shell.Write(new byte[] { 0x03 }, 0, 1);
+                    _shell.Flush();
+                }
+                else if (key.Key == ConsoleKey.D && key.Modifiers == ConsoleModifiers.Control)
+                {
+                    _shell.Write(new byte[] { 0x04 }, 0, 1);
+                    _shell.Flush();
+                    _isRunning = false;
+                    break;
                 }
                 else
                 {
-                    Thread.Sleep(10);
+                    var bytes = GetKeyBytes(key);
+                    if (bytes != null && bytes.Length > 0)
+                    {
+                        _shell.Write(bytes, 0, bytes.Length);
+                        _shell.Flush();
+                    }
                 }
             }
         }
@@ -254,6 +244,18 @@ internal class InteractiveShell
 
         try
         {
+            if (_shell != null)
+            {
+                _shell.DataReceived -= OnDataReceived;
+                _shell.Closed -= OnShellClosed;
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
             ConsoleInterop.RestoreMode(_originalInputMode, _originalOutputMode);
         }
         catch
@@ -274,6 +276,14 @@ internal class InteractiveShell
         try
         {
             _shell?.Dispose();
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            _exitEvent.Dispose();
         }
         catch
         {
